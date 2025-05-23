@@ -2,146 +2,188 @@ import streamlit as st
 import pandas as pd
 import xlrd
 import openpyxl
-from openpyxl import Workbook
-from openpyxl.styles import Font
-from openpyxl.utils import get_column_letter
 from io import BytesIO
 from datetime import datetime
+from openpyxl import Workbook
+from openpyxl.styles import Font
 
-st.title("Daily Staffing Analysis App")
+
+def get_individual_name(content: bytes, filename: str) -> str:
+    """Extract the person’s name from D3 (xls or xlsx)."""
+    if filename.lower().endswith(".xls"):
+        wb = xlrd.open_workbook(file_contents=content)
+        sh = wb.sheet_by_index(0)
+        return sh.cell_value(2, 3).split(",")[0].strip()
+    else:
+        wb = openpyxl.load_workbook(BytesIO(content), read_only=True, data_only=True)
+        raw = wb.worksheets[0].cell(row=3, column=4).value
+        return str(raw).split(",")[0].strip()
 
 
-# File uploader
-uploaded_files = st.file_uploader(
-    "Upload the per-person Excel files for the billing period.",
-    type=["xls", "xlsx"],
-    accept_multiple_files=True,
-)
+def detect_header_row(raw: pd.DataFrame) -> int:
+    """
+    Locate the zero-based row index of the "Date" header that sits
+    below "Time Zone:" and any ISP…LPN section header, regardless of
+    what's between ISP and LPN.
+    """
+    col0 = raw.iloc[:, 0].astype(str)
 
-if uploaded_files:
-    records = []
-    for file in uploaded_files:
-        content = file.read()
+    # find "Time Zone:"
+    tz_mask = col0.str.contains("Time Zone:", case=False, na=False)
+    tz_idx = tz_mask.idxmax() if tz_mask.any() else -1
 
-        # Extract individual name from D3
-        if file.name.lower().endswith(".xls"):
-            book = xlrd.open_workbook(file_contents=content)
-            sh = book.sheet_by_index(0)
-            file_ind = sh.cell_value(2, 3).split(",")[0].strip()
-        else:
-            wb2 = openpyxl.load_workbook(
-                BytesIO(content), read_only=True, data_only=True
-            )
-            sh2 = wb2.worksheets[0]
-            file_ind = str(sh2.cell(row=3, column=4).value).split(",")[0].strip()
+    # match any header that starts with ISP and later contains LPN
+    isp_mask = col0.str.contains(r"^ISP.*LPN", case=False, na=False)
+    isp_idx = isp_mask.idxmax() if isp_mask.any() else -1
 
-        # Read rows from Excel row 41 onward
-        df_temp = pd.read_excel(
-            BytesIO(content),
-            header=None,
-            skiprows=40,
-            usecols=[0, 3, 6],
-            names=["Date", "Duration", "Service Provider"],
-        )
+    # find all rows where column A literally equals "Date"
+    date_mask = col0.str.strip().str.lower() == "date"
+    candidates = raw.index[date_mask]
 
-        # Clean & parse
-        df_temp = df_temp.dropna(subset=["Date", "Duration"])
-        df_temp = df_temp[df_temp["Date"].astype(str) != "Date"]
-        df_temp["Date"] = pd.to_datetime(df_temp["Date"], errors="coerce").dt.date
-        df_temp = df_temp.dropna(subset=["Date"])
-        df_temp["Individual"] = file_ind
-        df_temp["Duration"] = (
-            df_temp["Duration"]
-            .astype(str)
-            .apply(lambda x: f"{x}:00" if len(x.split(":")) == 2 else x)
-        )
-        df_temp["Duration"] = (
-            pd.to_timedelta(df_temp["Duration"]).dt.total_seconds() / 3600
-        )
+    # pick the first "Date" row below both markers
+    threshold = max(tz_idx, isp_idx)
+    for r in candidates:
+        if r > threshold:
+            return r
 
-        records.append(df_temp)
+    raise RuntimeError("Could not locate the 'Date' header under the required section.")  
 
-    # Combine all into one DataFrame
-    df_raw = pd.concat(records, ignore_index=True)
 
-    # Build the summary workbook
+def find_pdn_lpn_block_end(raw: pd.DataFrame, header_row: int) -> int:
+    """
+    Find the end of the PDN-LPN block by looking for the first "Total"
+    in column C below the header row.
+    """
+    col2 = raw.iloc[:, 2].astype(str).str.strip().str.lower()
+    total_mask = (col2 == "total") & (raw.index > header_row)
+    end_candidates = raw.index[total_mask]
+    return end_candidates[0] if len(end_candidates) > 0 else len(raw)
+
+
+def parse_file(content: bytes, filename: str) -> pd.DataFrame:
+    """
+    Read one per-person sheet, isolate only the PDN-LPN block,
+    then return rows with a real Date in col A plus Duration (minutes) & Provider.
+    """
+    indiv = get_individual_name(content, filename)
+    raw = pd.read_excel(BytesIO(content), header=None)
+
+    header_row = detect_header_row(raw)
+    end_row = find_pdn_lpn_block_end(raw, header_row)
+
+    section = raw.iloc[header_row + 1 : end_row]
+    parsed = pd.to_datetime(section.iloc[:, 0], errors="coerce")
+    valid = parsed.notna()
+
+    df = section.loc[valid, [0, 4, 6]].copy()
+    df.columns = ["Date", "Duration_min", "Service Provider"]
+    df["Date"] = parsed[valid].dt.date
+    df["Duration"] = df["Duration_min"].astype(float) / 60.0
+    df["Individual"] = indiv
+
+    return df[["Date", "Service Provider", "Individual", "Duration"]]
+
+
+def format_duration(hours: float):
+    """If whole hours, return int; otherwise 'H:MM'."""
+    h = int(hours)
+    m = int(round((hours - h) * 60))
+    return h if m == 0 else f"{h}:{m:02d}"
+
+
+def build_summary_workbook(df_raw: pd.DataFrame) -> Workbook:
+    """
+    Build the DailyMatrix sheet with all durations formatted
+    as plain integers or 'H:MM' strings.
+    """
     wb = Workbook()
     ws = wb.active
     ws.title = "DailyMatrix"
     bold = Font(bold=True)
-    row = 1
-    individuals = sorted(df_raw["Individual"].unique())
 
-    for current_date in sorted(df_raw["Date"].unique()):
-        day_df = df_raw[df_raw["Date"] == current_date]
+    individuals = sorted(df_raw["Individual"].unique())
+    total_col = len(individuals) + 2
+    row = 1
+
+    for date in sorted(df_raw["Date"].unique()):
+        day = df_raw[df_raw["Date"] == date]
 
         # Date header
-        ws.cell(row=row, column=1, value=current_date.strftime("%m/%d/%Y")).font = bold
+        ws.cell(row=row, column=1, value=date.strftime("%m/%d/%Y")).font = bold
         row += 1
 
         # Column headers
         ws.cell(row=row, column=1, value="Service Provider").font = bold
-        for idx, indiv in enumerate(individuals, start=2):
-            ws.cell(row=row, column=idx, value=indiv).font = bold
-        total_col = 2 + len(individuals)
+        for idx, name in enumerate(individuals, start=2):
+            ws.cell(row=row, column=idx, value=name).font = bold
         ws.cell(row=row, column=total_col, value="Provider Total").font = bold
         row += 1
 
-        provider_start = row
-
-        # One row per provider
-        for provider in day_df["Service Provider"].unique():
-            ws.cell(row=row, column=1, value=provider)
-            for idx, indiv in enumerate(individuals, start=2):
-                hrs = day_df[
-                    (day_df["Service Provider"] == provider)
-                    & (day_df["Individual"] == indiv)
+        # Provider rows
+        for prov in day["Service Provider"].unique():
+            ws.cell(row=row, column=1, value=prov)
+            prov_sum = 0.0
+            for idx, name in enumerate(individuals, start=2):
+                hrs = day[
+                    (day["Service Provider"] == prov) & (day["Individual"] == name)
                 ]["Duration"].sum()
-                ws.cell(row=row, column=idx, value=hrs)
-
-            # SUM formula for provider total
-            c1 = get_column_letter(2)
-            c2 = get_column_letter(1 + len(individuals))
-            formula = f"=SUM({c1}{row}:{c2}{row})"
-            cell = ws.cell(row=row, column=total_col, value=formula)
-            cell.font = bold
+                prov_sum += hrs
+                ws.cell(row=row, column=idx, value=format_duration(hrs))
+            ws.cell(row=row, column=total_col, value=format_duration(prov_sum)).font = (
+                bold
+            )
             row += 1
-
-        provider_end = row - 1
 
         # Totals per individual
         ws.cell(row=row, column=1, value="Total hours for individual").font = bold
-        for idx in range(2, 2 + len(individuals)):
-            col = get_column_letter(idx)
-            formula = f"=SUM({col}{provider_start}:{col}{provider_end})"
-            cell = ws.cell(row=row, column=idx, value=formula)
-            cell.font = bold
+        indiv_sums = day.groupby("Individual")["Duration"].sum()
+        for idx, name in enumerate(individuals, start=2):
+            ws.cell(
+                row=row, column=idx, value=format_duration(indiv_sums.get(name, 0.0))
+            ).font = bold
         row += 1
 
-        # Remaining hours to 24h cap
+        # 24-hour cap remaining
         ws.cell(row=row, column=1, value="Total hrs pending in a 24hr period").font = (
             bold
         )
-        for idx in range(2, 2 + len(individuals)):
-            col = get_column_letter(idx)
-            above = f"{col}{row-1}"
-            formula = f"=24 - {above}"
-            cell = ws.cell(row=row, column=idx, value=formula)
-            cell.font = bold
+        for idx, name in enumerate(individuals, start=2):
+            used = indiv_sums.get(name, 0.0)
+            pending = max(0.0, 24.0 - used)
+            ws.cell(row=row, column=idx, value=format_duration(pending)).font = bold
         row += 2
 
-    # Prepare download
+    return wb
+
+
+def main():
+    st.title("Daily Staffing Analysis App")
+
+    files = st.file_uploader(
+        "Upload your per-person Excel files (.xls/.xlsx).",
+        type=["xls", "xlsx"],
+        accept_multiple_files=True,
+    )
+    if not files:
+        return
+
+    dfs = [parse_file(f.read(), f.name) for f in files]
+    df_raw = pd.concat(dfs, ignore_index=True)
+
+    wb = build_summary_workbook(df_raw)
     buf = BytesIO()
     wb.save(buf)
     buf.seek(0)
 
-    st.success("Summary workbook generated successfully!")
-
-    today_date = datetime.now().strftime("%Y-%m-%d")
-
+    st.success("✅ PDN-LPN summary ready!")
+    today = datetime.now().strftime("%Y-%m-%d")
     st.download_button(
-        label="Download Summary Excel",
+        "Download Summary Excel",
         data=buf,
-        file_name=f"daily_summary_{today_date}.xlsx",
+        file_name=f"daily_summary_{today}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
+
+if __name__ == "__main__":
+    main()
