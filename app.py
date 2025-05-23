@@ -1,11 +1,13 @@
+
+from io import BytesIO
+from datetime import datetime
 import streamlit as st
 import pandas as pd
 import xlrd
 import openpyxl
-from io import BytesIO
-from datetime import datetime
 from openpyxl import Workbook
 from openpyxl.styles import Font
+from openpyxl.utils import get_column_letter
 
 
 def get_individual_name(content: bytes, filename: str) -> str:
@@ -46,7 +48,7 @@ def detect_header_row(raw: pd.DataFrame) -> int:
         if r > threshold:
             return r
 
-    raise RuntimeError("Could not locate the 'Date' header under the required section.")  
+    raise RuntimeError("Could not locate the 'Date' header under the required section.")
 
 
 def find_pdn_lpn_block_end(raw: pd.DataFrame, header_row: int) -> int:
@@ -93,8 +95,7 @@ def format_duration(hours: float):
 
 def build_summary_workbook(df_raw: pd.DataFrame) -> Workbook:
     """
-    Build the DailyMatrix sheet with all durations formatted
-    as plain integers or 'H:MM' strings.
+    Build the DailyMatrix sheet, using Excel formulas for all totals.
     """
     wb = Workbook()
     ws = wb.active
@@ -102,9 +103,9 @@ def build_summary_workbook(df_raw: pd.DataFrame) -> Workbook:
     bold = Font(bold=True)
 
     individuals = sorted(df_raw["Individual"].unique())
-    total_col = len(individuals) + 2
-    row = 1
+    total_col = len(individuals) + 2  # last column index for Provider Total
 
+    row = 1
     for date in sorted(df_raw["Date"].unique()):
         day = df_raw[df_raw["Date"] == date]
 
@@ -119,27 +120,43 @@ def build_summary_workbook(df_raw: pd.DataFrame) -> Workbook:
         ws.cell(row=row, column=total_col, value="Provider Total").font = bold
         row += 1
 
+        # mark where provider rows start
+        provider_start = row
+
         # Provider rows
         for prov in day["Service Provider"].unique():
             ws.cell(row=row, column=1, value=prov)
-            prov_sum = 0.0
+
+            # write each individual's hours as plain number/text
             for idx, name in enumerate(individuals, start=2):
                 hrs = day[
                     (day["Service Provider"] == prov) & (day["Individual"] == name)
                 ]["Duration"].sum()
-                prov_sum += hrs
                 ws.cell(row=row, column=idx, value=format_duration(hrs))
-            ws.cell(row=row, column=total_col, value=format_duration(prov_sum)).font = (
-                bold
-            )
+
+            # write an Excel SUM formula for this provider’s total across all individuals
+            first_data_col = get_column_letter(2)
+            last_data_col = get_column_letter(1 + len(individuals))
+            ws.cell(
+                row=row,
+                column=total_col,
+                value=f"=SUM({first_data_col}{row}:{last_data_col}{row})",
+            ).font = bold
+
             row += 1
 
-        # Totals per individual
+        # mark where provider rows end
+        provider_end = row - 1
+
+        # Totals per individual (row of sums)
         ws.cell(row=row, column=1, value="Total hours for individual").font = bold
-        indiv_sums = day.groupby("Individual")["Duration"].sum()
         for idx, name in enumerate(individuals, start=2):
+            col_letter = get_column_letter(idx)
+            # sum all the cells in this column from provider_start to provider_end
             ws.cell(
-                row=row, column=idx, value=format_duration(indiv_sums.get(name, 0.0))
+                row=row,
+                column=idx,
+                value=f"=SUM({col_letter}{provider_start}:{col_letter}{provider_end})",
             ).font = bold
         row += 1
 
@@ -147,11 +164,11 @@ def build_summary_workbook(df_raw: pd.DataFrame) -> Workbook:
         ws.cell(row=row, column=1, value="Total hrs pending in a 24hr period").font = (
             bold
         )
-        for idx, name in enumerate(individuals, start=2):
-            used = indiv_sums.get(name, 0.0)
-            pending = max(0.0, 24.0 - used)
-            ws.cell(row=row, column=idx, value=format_duration(pending)).font = bold
-        row += 2
+        for idx in range(2, 2 + len(individuals)):
+            col_letter = get_column_letter(idx)
+            # subtract the total-hours cell (just above) from 24
+            ws.cell(row=row, column=idx, value=f"=24 - {col_letter}{row-1}").font = bold
+        row += 2  # blank line before next date block
 
     return wb
 
