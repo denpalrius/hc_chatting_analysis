@@ -61,13 +61,17 @@ def find_pdn_lpn_block_end(raw: pd.DataFrame, header_row: int) -> int:
     end_candidates = raw.index[total_mask]
     return end_candidates[0] if len(end_candidates) > 0 else len(raw)
 
+def get_acronym(name: str) -> str:
+    """Return the acronym (initials) for a given name string."""
+    return "".join([part[0].upper() for part in name.split() if part])
 
 def parse_file(content: bytes, filename: str) -> pd.DataFrame:
     """
     Read one per-person sheet, isolate only the PDN-LPN block,
     then return rows with a real Date in col A plus Duration (minutes) & Provider.
     """
-    indiv = get_individual_name(content, filename)
+    indiv_full = get_individual_name(content, filename)
+    indiv = get_acronym(indiv_full)
     raw = pd.read_excel(BytesIO(content), header=None)
 
     header_row = detect_header_row(raw)
