@@ -5,3 +5,6 @@ __pycache__/
 # Data files
 data/
 results/
+
+# Venv
+venv/
